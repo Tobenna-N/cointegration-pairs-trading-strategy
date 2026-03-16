@@ -14,5 +14,5 @@ Vector Error Correction Model
 The strategy produced a positive Sharpe ratio after transaction costs.
 
 ## Tools
+R
 RStudio
-Econometric time series methods (ADF, KPSS, Johansen cointegration, VECM)  
