@@ -1,0 +1,258 @@
+---
+title: "Cointegration and Pairs Trading: AAPL, MSFT, and GOOG (2011–2025)"
+author: " Tobenna Nwogu-Agbakuru "
+date: "2025-07-16"
+format: pdf
+editor: visual
+echo: false
+warning: false
+
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(quantmod)
+library(tidyverse)
+library(urca)
+library(tseries)
+library(vars)
+library(zoo)
+library(ggplot2)
+library(reshape2)
+library(TTR)
+library(FinTS)
+library(sandwich)
+library(lmtest)
+```
+
+```{r}
+# Define tickers and date range
+tickers <- c("AAPL", "MSFT", "GOOG")
+start_date <- as.Date("2011-07-01")
+end_date <- as.Date("2025-06-30")
+
+# Download adjusted closing prices
+getSymbols(tickers, src = "yahoo", from = start_date, to = end_date)
+prices <- merge(Ad(get(tickers[1])), Ad(get(tickers[2])), Ad(get(tickers[3])))
+colnames(prices) <- tickers
+
+```
+
+```{r}
+prices_df <- data.frame(Date = index(prices), coredata(prices))
+
+# Melt to long format
+prices_long <- melt(prices_df, id.vars = "Date",
+                    variable.name = "Stock", value.name = "Price")
+
+# Plot with legend
+ggplot(prices_long, aes(x = Date, y = Price, color = Stock)) +
+  geom_line(size = 0.8) +
+  labs(title = "Daily Adjusted Closing Prices (AAPL, MSFT, GOOG)",
+       x = "Date", y = "Price (USD)",
+       color = "Stock") +
+  theme_minimal()
+
+```
+
+```{r}
+# ADF tests
+adf_results <- lapply(as.data.frame(prices), function(x) adf.test(x, k=1))
+adf_results
+
+# KPSS tests
+kpss_results <- lapply(as.data.frame(prices), function(x) kpss.test(x, null="Level"))
+kpss_results
+
+```
+
+```{r}
+# johansen_test
+# Select optimal VAR lag 
+log_prices <- log(prices)
+lag_sel <- VARselect(log_prices, lag.max = 10, type = "const")$selection
+lag_sel
+
+K_opt <- as.integer(lag_sel["AIC(n)"])   # use AIC; change if you prefer HQ or SC
+K_opt
+
+johansen_test <- ca.jo(log_prices, type = "trace", ecdet = "const", K = K_opt)
+summary(johansen_test)
+
+```
+
+```{r}
+# Vector Error Correction Model (ECM)
+
+# r=1 from Johansen trace test
+vecm_model <- cajorls(johansen_test, r = 1)  
+summary(vecm_model$rlm)
+
+```
+
+```{r}
+# Robust inference for the VECM (Newey–West)
+coeftest(vecm_model$rlm, vcov = NeweyWest(vecm_model$rlm, lag = 20, prewhite = FALSE))
+
+```
+
+```{r}
+#  VECM residual diagnostics
+# Ljung-Box test for autocorrelation (lag 20 as example)
+# ARCH-LM test for conditional heteroskedasticity
+residuals_vecm <- resid(vecm_model$rlm)
+
+for (col in colnames(residuals_vecm)) {
+  cat("\nResidual diagnostics for", col, "\n")
+  print(Box.test(residuals_vecm[, col], type = "Ljung", lag = 20))
+  print(ArchTest(residuals_vecm[, col], lags = 12))
+}
+
+```
+
+```{r}
+#Spread Construction & Trading Simulation (AAPL base)
+
+# Cointegration vector (AAPL as base) 
+beta <- johansen_test@V[, 1]              
+b_raw <- beta[1:3]                       
+b <- b_raw / b_raw[1]                     
+b_const <- beta[4] / b_raw[1]             
+
+# Spread (level) for signal generation 
+spread <- drop(log_prices %*% b) + as.numeric(b_const)
+spread <- xts(spread, order.by = index(log_prices))
+
+# Plot spread with mean and ±1σ bands
+sp_mean <- mean(spread, na.rm = TRUE)
+sp_sd   <- sd(spread, na.rm = TRUE)
+plot(spread, main = "Cointegration Spread (AAPL base)", col = "blue", ylab = "Spread")
+abline(h = sp_mean, col = "red", lty = 2)
+abline(h = sp_mean + sp_sd, col = "darkgray", lty = 3)
+abline(h = sp_mean - sp_sd, col = "darkgray", lty = 3)
+
+# Trading signals (mean reversion on spread)
+sig <- ifelse(spread > sp_mean + sp_sd, -1,
+              ifelse(spread < sp_mean - sp_sd,  1, 0))
+sig <- xts(sig, order.by = index(spread))
+
+# Portfolio returns using hedge ratios from beta (exclude constant) 
+# Use log returns; portfolio return each day is b' * Δlog_prices (AAPL=1, MSFT=b2, GOOG=b3)
+rets <- diff(log_prices)
+port_ret <- drop(rets %*% b)                       
+port_ret <- xts(port_ret, order.by = index(rets))
+
+# Strategy returns: use previous-day signal (to avoid lookahead)
+sig_lag <- Lag(sig, k = 1)
+strat_ret <- sig_lag * port_ret
+strat_ret[is.na(strat_ret)] <- 0
+
+# Cumulative returns 
+cum_ret <- cumsum(strat_ret)
+
+# Plot cumulative returns
+plot(cum_ret, type = "l", col = "darkgreen", lwd = 1.5,
+     main = "Pairs Trading Strategy: Cumulative Log Return",
+     ylab = "Cumulative Log Return", xlab = "Date")
+abline(h = 0, col = "red", lty = 2, lwd = 1.2)
+legend("topleft", legend = c("Cumulative Return", "Zero Line"),
+       col = c("darkgreen", "red"), lty = c(1, 2),
+       lwd = c(1.5, 1.2), bty = "n", cex = 0.85)
+
+```
+
+```{r}
+# Additional performance metrics
+
+# Max drawdown (%), using equity from log returns
+equity <- exp(cum_ret)
+dd <- 1 - (equity / cummax(equity))
+max_dd_pct <- max(dd, na.rm = TRUE)
+
+# Hit ratio (daily)
+hit_ratio_daily <- mean(strat_ret > 0, na.rm = TRUE)
+
+# Trade-level hit ratio & average holding period
+sig_lag_vec <- as.vector(sig_lag)
+active <- sig_lag_vec != 0
+active[is.na(active)] <- FALSE
+runs <- rle(active)
+
+# average holding period (days)
+hold_lengths <- runs$lengths[runs$values]
+avg_hold_days <- if (length(hold_lengths)) mean(hold_lengths) else NA_real_
+
+# trade PnL
+trade_pnls <- c()
+idx <- 0L
+for (k in seq_along(runs$lengths)) {
+  len <- runs$lengths[k]; idx_end <- idx + len
+  if (isTRUE(runs$values[k])) {
+    seg <- strat_ret[(idx + 1L):idx_end]
+    trade_pnls <- c(trade_pnls, sum(seg, na.rm = TRUE))
+  }
+  idx <- idx_end
+}
+hit_ratio_trades <- if (length(trade_pnls)) mean(trade_pnls > 0) else NA_real_
+
+# Basic performance summary 
+n_trades <- sum(diff(sig != 0) == 1, na.rm = TRUE)   # count entries
+avg_ret  <- mean(strat_ret, na.rm = TRUE)
+sd_ret   <- sd(strat_ret, na.rm = TRUE)
+sharpe   <- ifelse(sd_ret == 0, NA, avg_ret / sd_ret * sqrt(252))
+
+cat("Number of trades:", n_trades, "\n")
+cat("Average daily return:", round(avg_ret, 6), "\n")
+cat("Daily return SD:", round(sd_ret, 6), "\n")
+cat("Approx. daily Sharpe (252):", round(sharpe, 3), "\n")
+cat("Max drawdown (%):", round(100 * max_dd_pct, 2), "\n")
+cat("Hit ratio (daily):", round(100 * hit_ratio_daily, 1), "%\n")
+cat("Hit ratio (trades):", ifelse(is.na(hit_ratio_trades), "NA",
+                                  paste0(round(100 * hit_ratio_trades, 1), "%")), "\n")
+cat("Average holding period (days):", round(avg_hold_days, 2), "\n")
+
+```
+
+```{r}
+#Cost-adjusted backtest (per-side costs on every position change) 
+cost_per_side <- 0.0005  # 0.05% per side
+
+# Align lagged position vector to strategy return index
+sig_lag_aligned <- sig_lag[index(strat_ret)]
+
+# Position changes (0->1 or 1->0 => 1 side; 1->-1 or -1->1 => 2 sides)
+pos_change <- diff(sig_lag_aligned)
+pos_change[is.na(pos_change)] <- 0
+
+# Build daily cost series aligned to strat_ret
+costs_raw <- cost_per_side * abs(pos_change)                        # per-day transaction cost
+cost_per_day <- merge(strat_ret, costs_raw, join = "left")[, 2]     # align to strat_ret index
+cost_per_day[is.na(cost_per_day)] <- 0
+
+# Cost-adjusted returns & cumulative return
+strat_ret_cost_adj <- strat_ret - cost_per_day
+cum_ret_cost <- cumsum(strat_ret_cost_adj)
+
+# Recompute metrics with costs
+avg_ret_cost <- mean(strat_ret_cost_adj, na.rm = TRUE)
+sd_ret_cost  <- sd(strat_ret_cost_adj, na.rm = TRUE)
+sharpe_cost  <- ifelse(sd_ret_cost == 0, NA, avg_ret_cost / sd_ret_cost * sqrt(252))
+
+# (Optional) cost-adjusted equity plot
+plot(cum_ret_cost, type = "l", lwd = 1.5,
+     main = "Pairs Trading Strategy: Cumulative Log Return (Cost-Adjusted)",
+     ylab = "Cumulative Log Return", xlab = "Date")
+abline(h = 0, lty = 2)
+
+# Trade counting that matches costs:
+n_pos_changes <- sum(abs(coredata(pos_change)) > 0, na.rm = TRUE)
+
+# Summaries
+total_cost <- sum(cost_per_day, na.rm = TRUE)
+
+cat("\n--- Cost-Adjusted Performance ---\n")
+cat("Total transaction cost (sum of daily costs):", round(total_cost, 4), "\n")
+cat("Position change events (entries/exits/flips):", n_pos_changes, "\n")
+cat("Cost-adjusted average daily return:", round(avg_ret_cost, 6), "\n")
+cat("Cost-adjusted Sharpe (252):", round(sharpe_cost, 3), "\n")
+
+```
